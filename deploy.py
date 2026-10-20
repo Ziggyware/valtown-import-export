@@ -130,6 +130,36 @@ def list_remote() -> list[str]:
         offset += limit
 
 
+def compare_remote(batch: dict[str, tuple[str, str]], existing: set[str],
+                   jobs: int) -> dict[str, str]:
+    """Snapshot selected existing files in a disposable directory, then compare.
+
+    Any failed download aborts the entire preflight before remote writes. Use
+    numbered snapshot names so server-provided paths never become disk paths.
+    """
+    states = {r: "NEW" for r in batch if r not in existing}
+    with tempfile.TemporaryDirectory(prefix="valtown-deploy-") as snapshot:
+        def download(index, remote):
+            code, body = call("GET", content_url(remote))
+            if code != 200:
+                raise RuntimeError(f"download {remote}: GET {code} "
+                                   f"{body.decode('utf-8', 'replace')[:160]}")
+            path = os.path.join(snapshot, str(index))
+            with open(path, "wb") as f:
+                f.write(body)
+            return remote, path
+
+        with cf.ThreadPoolExecutor(max_workers=jobs) as ex:
+            futures = [ex.submit(download, i, r)
+                       for i, r in enumerate(sorted(set(batch) & existing))]
+            downloaded = [future.result() for future in futures]
+        for remote, path in downloaded:
+            with open(path, "rb") as f:
+                same = f.read() == batch[remote][1].encode("utf-8")
+            states[remote] = "SAME" if same else "UPDATED"
+    return states
+
+
 def ensure_parent_dirs(remote_path: str) -> str | None:
     """Create every ancestor directory of `remote_path`. Returns None on success,
     or a string describing the first failure."""
@@ -515,19 +545,6 @@ def main() -> int:
             continue
         batch[remote] = (abs_path, content)
 
-    if a.dry_run:
-        for remote, (abs_path, content) in sorted(batch.items()):
-            rel_disp = os.path.relpath(abs_path)
-            print(f"[dry-run] upload {rel_disp} -> {remote} ({len(content)} chars)")
-        if a.prune:
-            existing = set(list_remote())
-            plan_keys = set(batch.keys())
-            for doomed in sorted(existing - plan_keys):
-                if not doomed.startswith("."):
-                    print(f"[dry-run] delete {doomed}")
-        print(f"{len(batch)} file(s) planned, {fails} failed at read")
-        return min(fails, 255)
-
     if a.verify:
         with cf.ThreadPoolExecutor(max_workers=a.jobs) as ex:
             futs = {ex.submit(verify_one, r, c): (r, a_) for r, (a_, c) in batch.items()}
@@ -544,11 +561,35 @@ def main() -> int:
         print(f"{ok}/{len(batch)} match")
         return min(fails, 255)
 
+    # Complete the remote snapshot/comparison before making any remote writes.
+    try:
+        existing = set(list_remote())
+        states = compare_remote(batch, existing, a.jobs)
+    except (OSError, RuntimeError) as e:
+        print(f"FAIL     comparison aborted; no files deployed: {e}", file=sys.stderr)
+        return min(fails + 1, 255)
+    for remote, (abs_path, _) in sorted(batch.items()):
+        print(f"{states[remote]:<8} {os.path.relpath(abs_path)} -> {remote}")
+    unchanged = {r for r, state in states.items() if state == "SAME"}
+    changes = {r: item for r, item in batch.items() if r not in unchanged}
+    print(f"{sum(s == 'NEW' for s in states.values())} new, "
+          f"{sum(s == 'UPDATED' for s in states.values())} updated, "
+          f"{len(unchanged)} unchanged")
+
+    if a.dry_run:
+        for remote, (abs_path, content) in sorted(changes.items()):
+            print(f"[dry-run] upload {os.path.relpath(abs_path)} -> {remote} ({len(content)} chars)")
+        if a.prune and not fails:
+            for doomed in sorted(existing - set(batch) - RESERVED_REMOTE):
+                print(f"[dry-run] delete {doomed}")
+        print(f"{len(changes)} file(s) planned, {fails} failed at read")
+        return min(fails, 255)
+
     # Upload
-    print(f"deploying {len(batch)} file(s) to val {VAL_ID} with {a.jobs} worker(s)")
+    print(f"deploying {len(changes)} file(s) to val {VAL_ID} with {a.jobs} worker(s)")
     with cf.ThreadPoolExecutor(max_workers=a.jobs) as ex:
-        futs = {ex.submit(upload_one, r, c): (r, a_) for r, (a_, c) in batch.items()}
-        succeeded: set[str] = set()
+        futs = {ex.submit(upload_one, r, c): (r, a_) for r, (a_, c) in changes.items()}
+        succeeded: set[str] = set(unchanged)
         for fut in cf.as_completed(futs):
             remote = futs[fut][0]
             abs_path = futs[fut][1]

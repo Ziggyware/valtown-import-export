@@ -77,6 +77,21 @@ both work. Parent directories are created automatically on the val. The file's
 `type` is set to `script` for `.ts/.tsx/.js/.jsx/.mjs/.cjs` and `file` for
 everything else.
 
+### Compare before deploying
+
+Every deploy lists the remote files and downloads the selected existing files
+into an automatically cleaned-up temporary directory before making any remote
+writes. It reports `NEW`, `UPDATED`, or `SAME` for each selected path, then
+uploads only new or updated files. Unchanged files remain in the deploy manifest
+and are protected from `--prune`.
+
+The comparison uses exact UTF-8 bytes against the text read locally (Python's
+normal newline handling applies); unlike `--verify`, it does not strip whitespace.
+A failed snapshot download aborts deployment without uploading or pruning.
+`--dry-run` performs the same comparison using read-only API requests, while
+`--verify` remains a separate read-only verification mode. Remote files can still
+change after the snapshot; this is not an atomic deployment or a remote lock.
+
 ### Options
 
 | Flag | Effect |
@@ -90,7 +105,7 @@ everything else.
 | `--match GLOB` / `--exclude GLOB` | filter paths (repeatable) |
 | `--list` | list what's on the val and exit |
 | `--verify` | GET each file back and compare (CRLF/outer-whitespace normalized) |
-| `--dry-run` | print what would be uploaded; network writes |
+| `--dry-run` | download and compare, then print planned uploads/deletions; no writes |
 | `--prune` | after a successful upload, delete remote files not in this upload (prompts; `-y` to skip) |
 | `-y`, `--yes` | assume yes to prompts |
 | `--jobs N` | parallel uploads (default 4) |
