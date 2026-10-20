@@ -1,111 +1,215 @@
-# pull.py
+# valtown-import-export
 
-Pull files from the **free-ai** Val Town val down to local disk. The mirror of `deploy.py`: same val, same token, same `/files/content` endpoint, opposite direction.
+Two-file, zero-dependency Python 3.8+ toolkit for round-tripping files between
+your local disk and a [Val Town](https://val.town) val, **preserving folder
+structures** and supporting any val by id.
 
-- Python 3.8+, standard library only.
-- Files are handled as raw bytes: no re-encoding, no CRLF translation on write.
+- `deploy.py` — upload local files to a val (create/update, mkdir parents, parallel, verify, prune)
+- `pull.py` — download remote files to local disk (stateful mirror, conflicts, zip, prune)
+
+Both scripts use the Val Town v2 API, speak JSON over `urllib`, need no
+third-party packages, and take a val id as a UUID:
+
+```
+dd19ff18-a516-473d-a3e0-9f8e66d14a90
+```
 
 ## Setup
 
+```bash
+# bash / zsh
+export VT=vtwn_...           # Val Town API token (needs read/write on the val)
+export VT_VAL=dd19ff18-a516-473d-a3e0-9f8e66d14a90   # optional; or pass --val
+```
 ```powershell
 # PowerShell
 $env:VT = "vtwn_..."
-```
-```bash
-# bash
-export VT=vtwn_...
+$env:VT_VAL = "dd19ff18-a516-473d-a3e0-9f8e66d14a90"
 ```
 
-`VT` is the same Val Town token `deploy.py` uses. It needs read access to the val.
+If you don't set `VT_VAL` or pass `--val`, the scripts fall back to a built-in
+default val id (originally the "Cuefield" val). Edit `DEFAULT_VAL` at the top
+of each script to repoint permanently.
 
-## Where files go
+---
 
-| You want | Command |
+## `deploy.py` — upload to a val
+
+```
+python deploy.py [files/dirs/globs ...] [options]
+```
+
+### Picking a val
+
+| What | How |
 |---|---|
-| Loose files in the **current directory** | `python pull.py app.tsx app-helpers.ts` |
-| Loose files in a **specified path** | `python pull.py --all --to C:\dev\free-ai` |
-| A **zip** in the current directory | `python pull.py --all --zip` |
-| A zip in a specified directory | `python pull.py --all --zip --to C:\backups` |
-| A zip at an exact filename | `python pull.py --all --zip --to C:\backups\free-ai.zip` |
+| Flag on every run | `--val dd19ff18-a516-473d-a3e0-9f8e66d14a90` |
+| Env var | `VT_VAL=dd19ff18-a516-473d-a3e0-9f8e66d14a90` |
+| Default | edit `DEFAULT_VAL` at top of script |
 
-With `--zip`, a `--to` value ending in `.zip` is the output file; anything else is a directory to put `free-ai-<UTC timestamp>.zip` in. Missing directories are created. `--out` is accepted as an alias of `--to`.
+The argument is validated as a UUID and rejected early with a clear error if it
+doesn't match the `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` shape.
 
-## Choosing files
+### Folder structures
 
-- Name them: `python pull.py app.tsx app-helpers.ts`
-- Wildcards: `python pull.py "*.ts"` (matched against remote paths; quote them in bash. PowerShell does not expand wildcards for native commands, so this works there too).
-- Everything: `--all`
-- Filter: `--match GLOB` / `--exclude GLOB`, repeatable. A glob matches the full remote path or just the filename.
-- Inspect only: `--list` prints remote paths and writes nothing.
+Files are uploaded **with their path relative to where you invoked the script**:
 
-If `a/b.ts` is not found remotely, `pull.py` retries `b.ts`, because `deploy.py` uploads by basename. So `python pull.py app/app.tsx` works after `python deploy.py app/app.tsx`. The file lands at the name it has remotely (`./app.tsx`).
+```bash
+python deploy.py src/app.tsx src/lib/helpers.ts
+# remote paths:  src/app.tsx, src/lib/helpers.ts
 
-## What happens when a local file already exists
+python deploy.py -r src/                # -r = recursive; dir tree preserved
+# remote paths:  app.tsx, components/Card.tsx, lib/helpers.ts
+# (because src/ is the root of the traversal, not part of each file's rel)
 
-Every pull compares the remote bytes with the local file (CRLF vs LF and outer whitespace ignored) and with a record of what was pulled last time (`.pull-manifest.json` in the destination directory).
+python deploy.py --all -C src/          # everything under src/, src/ is root
+# same result as -r src/ but src/ is also the working directory
+
+python deploy.py src/ -r --prefix v2    # nest the upload under v2/
+# remote paths:  v2/app.tsx, v2/components/Card.tsx, v2/lib/helpers.ts
+
+python deploy.py -r src/ --strip 1      # strip 1 leading segment
+# remote paths:  Card.tsx, helpers.ts  (app.tsx had only 1 segment and is skipped)
+```
+
+Globs are supported (`src/**/*.ts`, etc.). On Windows, forward and back slashes
+both work. Parent directories are created automatically on the val. The file's
+`type` is set to `script` for `.ts/.tsx/.js/.jsx/.mjs/.cjs` and `file` for
+everything else.
+
+### Options
+
+| Flag | Effect |
+|---|---|
+| `--val UUID` | target val id (overrides env and default) |
+| `-C DIR`, `--directory DIR` | run as if `cd`'d into DIR first (like `make -C`) |
+| `-r`, `--recursive` | descend into any directory arguments |
+| `--all` | upload every non-ignored file under `-C DIR` (recursive) |
+| `--prefix P` | prepend `P/` to every remote path |
+| `--strip N` | drop `N` leading segments from computed remote paths |
+| `--match GLOB` / `--exclude GLOB` | filter paths (repeatable) |
+| `--list` | list what's on the val and exit |
+| `--verify` | GET each file back and compare (CRLF/outer-whitespace normalized) |
+| `--dry-run` | print what would be uploaded; network writes |
+| `--prune` | after a successful upload, delete remote files not in this upload (prompts; `-y` to skip) |
+| `-y`, `--yes` | assume yes to prompts |
+| `--jobs N` | parallel uploads (default 4) |
+| `--retries N` | retries on 429/5xx/network errors with exponential backoff + jitter (default 3) |
+| `--force-basename` | legacy mode: flatten everything to its basename (old behaviour) |
+
+### Safety & quality
+
+- **UTF-8 only**: binary files are refused with a clear error rather than being
+  mangled into a JSON string.
+- **80 000 char guard**: Val Town rejects files over this limit; they're flagged
+  locally instead of after a wasted upload.
+- **Path safety**: absolute paths, drive letters, `..`, and reserved names
+  (`MANIFEST.sha256.json`, `.pull-manifest.json`, `.deploy-manifest.json`) are
+  refused.
+- **Symlink escape guard**: recursive uploads skip symlinks that point outside
+  the directory being uploaded.
+- **Noise ignored**: common non-source directories (`.git`, `node_modules`,
+  `dist`, `build`, `__pycache__`, `.next`, etc.) are skipped during recursion.
+- **Duplicate detection**: if two local files map to the same remote path the
+  last wins with a warning.
+- **Retry with backoff**: 429/5xx/network errors are retried with exponential
+  backoff, respecting `Retry-After`.
+- **Atomic state**: a `.deploy-manifest.json` is written in the current
+  directory after a successful run so the next `--prune` knows what was you.
+- **Exit code** = number of files that failed, capped at 255; `0` on full success.
+
+### Examples
+
+```bash
+# Point at a specific val and mirror a local folder into it under site/
+python deploy.py --val dd19ff18-a516-473d-a3e0-9f8e66d14a90 --all -C ./site --prefix site --prune -y
+
+# Preview an upload (no writes)
+python deploy.py -r src/ --dry-run
+
+# Recursive into a directory, flatten into val root
+python deploy.py -r dist/ --strip 1 --prefix static
+
+# Verify nothing drifted
+python deploy.py --verify src/app.tsx src/lib/helpers.ts
+```
+
+---
+
+## `pull.py` — download from a val
+
+Mirror of `deploy.py` for the other direction. See the inline help (`python
+pull.py -h`) for the full option set; highlights:
+
+| Flag | Effect |
+|---|---|
+| `--val UUID` | target val id (same semantics as deploy) |
+| `--to PATH` | destination directory (or exact `.zip` file with `--zip`) |
+| `--zip` | produce one deterministic zip instead of loose files |
+| `--all` | pull every file |
+| `--list` | list remote paths and exit |
+| `--match GLOB` / `--exclude GLOB` | filters (repeatable) |
+| `--diff` | unified diff local vs remote; writes nothing |
+| `--dry-run` | report what would happen |
+| `--prune` | delete unedited local files that no longer exist remotely (empty parent dirs are cleaned up) |
+| `--force` | overwrite locally edited files, keeping a `.bak-<timestamp>` |
+| `--prefix P` / `--strip N` | remap remote paths onto local layout |
+| `--jobs N`, `--retries N` | parallelism / retries (defaults 4 / 3) |
+
+### State machine per file
+
+Every pull compares remote bytes with the local file and with a per-destination
+`.pull-manifest.json` tracking what you pulled last time:
 
 | State | Meaning | Action |
 |---|---|---|
 | `NEW` | no local file | write it |
-| `SAME` | local equals remote | nothing |
-| `UPDATED` | local equals what you pulled last time (unedited), remote has moved on | overwrite |
-| `CONFLICT` | local differs and cannot be safely fast-forwarded | write the remote copy to `<file>.remote` beside yours, leave your file alone, count as a failure |
-| `FORCED` | `CONFLICT` plus `--force` | copy your file to `<file>.bak-<timestamp>`, then overwrite |
+| `SAME` | local equals remote (CRLF/outer-whitespace ignored) | nothing |
+| `UPDATED` | local equals last pull, remote moved on | overwrite (fast-forward) |
+| `CONFLICT` | local edited and cannot fast-forward | write `<file>.remote`, count as failure |
+| `FORCED` | `CONFLICT` + `--force` | copy to `<file>.bak-<stamp>`, then overwrite |
 
-A `.remote` sidecar is deleted automatically once the file is resolved. With no manifest yet (first pull into a directory that already has files), any differing file is a `CONFLICT`.
+A `.remote` sidecar is deleted automatically once the conflict is resolved.
 
-## Other options
+### Zip mode
 
-| Flag | Effect |
-|---|---|
-| `--diff` | unified diff local vs remote, writes nothing. Exit code = number of files that differ |
-| `--dry-run` | report what would happen; writes nothing (no files, no manifest, no zip) |
-| `--prune` | delete local files you previously pulled that were deleted remotely (see below) |
-| `--jobs N` | parallel downloads, default 4 |
-| `--retries N` | retries on HTTP 429, 5xx and network errors, default 3 |
+- Entries sorted by path, timestamps fixed at 1980-01-01, fixed permissions —
+  pulling the same content twice produces a byte-identical zip (same zlib
+  build), so you can compare zips by hash.
+- Includes `MANIFEST.sha256.json` with every file's size + SHA-256.
+- Prints the zip's overall SHA-256.
+- Default filename is `<val-slug>-<UTC stamp>.zip` (e.g. `dd19ff18-20261020-143000.zip`).
 
-Retries use exponential backoff with jitter and honour `Retry-After`.
+### Safety
 
-### `--prune`
+- **Atomic writes** via temp file + rename (no truncated files on interrupt).
+- **Path-traversal guard** (zip-slip, absolute paths, drive letters, `..`).
+- **Prune refuses to run** without a manifest (you can't prune what you never
+  pulled) unless you pass `-y`.
+- **Manifest tracks val id**: pulling the same directory from two different vals
+  prints a warning instead of silently overwriting.
+- Reserved names (`MANIFEST.sha256.json`, `.pull-manifest.json`,
+  `.deploy-manifest.json`) are never written or pulled.
 
-Deletes a local file only if all three hold: it is in the manifest (you pulled it before), a direct request for it returns 404 (so a truncated listing cannot cause deletions), and it is unedited since the pull. Anything else is reported as `KEPT`. Combine with `--dry-run` first.
+### Examples
 
-### Zip contents
-
-- Entries sorted by path, timestamps fixed at 1980-01-01, fixed permissions: pulling unchanged content twice produces a byte-identical zip, so you can compare zips by hash. The zip's SHA-256 is printed.
-- `MANIFEST.sha256.json` inside lists the byte size and SHA-256 of every file.
-- Byte-identical output assumes the same zlib build. The same content under a different Python/zlib may compress to different bytes.
-- `--zip` cannot be combined with `--diff`, `--prune` or `--force`.
-
-## Safety
-
-- **Atomic writes**: each file is written to a temp file then renamed, so an interrupted pull never leaves a truncated file.
-- **Path guard**: remote paths that are absolute, contain `..`, or contain `:` (drive letters, NTFS streams) are refused, and any destination resolving outside the target directory is refused.
-- Nothing is overwritten without being either unedited, or backed up (`--force`).
-
-## Exit codes
-
-The number of files that failed, conflicted, or (with `--diff`) differed, capped at 255. `0` means everything is fine.
-
-## Examples
-
-```powershell
-python pull.py --list                                   # what is on the val?
-python pull.py --diff app.tsx                           # how does my copy differ?
-python pull.py --all --dry-run --to C:\dev\free-ai      # preview a full mirror
-python pull.py --all --to C:\dev\free-ai --prune        # mirror, remove files deleted remotely
-python pull.py --all --exclude "*.md" --zip             # snapshot without markdown
-python pull.py app.tsx --force                          # take remote, keep a .bak
+```bash
+python pull.py --val dd19ff18-a516-473d-a3e0-9f8e66d14a90 --list
+python pull.py --val dd19ff18-a516-473d-a3e0-9f8e66d14a90 --all --to ./mirror
+python pull.py --val dd19ff18-a516-473d-a3e0-9f8e66d14a90 --all --zip
+python pull.py --all --diff                  # see how local differs
+python pull.py --all --to ./mirror --prune   # exact mirror, remove deleted files
+python pull.py "*.ts"                        # wildcard match
 ```
 
-## Troubleshooting
+---
 
-- **`VT is not set`**: set the token in the same shell session you run the script from.
-- **`list failed`** on `--all`, `--list`, `--prune` or wildcards: the file-listing request failed. Named pulls (`python pull.py app.tsx`) do not use it and still work. The listing parameters (`recursive`, `limit`, `offset`) were written from memory of the Val Town v2 API; check them against the current API docs if listing breaks.
-- **`PermissionError` on Windows**: another program (an editor, a sync client) has the file locked. The file is reported as failed; nothing is corrupted.
-- **Same-named files in different remote folders**: named pulls use the path you give, with the basename fallback described above; use `--all` to get every path exactly.
+## Notes / limits
 
-## Limits
-
-- Names inside the val are treated as paths with `/` separators.
-- `MANIFEST.sha256.json` and `.pull-manifest.json` are reserved names; a remote file with either name would collide.
+- Val Town file content is stored as UTF-8 text. Binary files are not supported
+  by the v2 files API; `deploy.py` refuses them with a clear message.
+- Single-file content is limited to 80 000 characters by Val Town.
+- Names are POSIX paths with `/` separators; backslashes are normalised.
+- The scripts accept `VT` (token) and `VT_VAL` (default target val id) from the
+  environment; either can be overridden with a command-line flag.
+- Standard library only — no `pip install` step needed.
